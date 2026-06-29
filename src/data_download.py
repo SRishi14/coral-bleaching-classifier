@@ -248,8 +248,10 @@ def download_region_cube(region_key: str) -> xr.Dataset:
             ) from e
 
     # BAA is an integer alert level; restore the dtype after the float cast above.
+    # Land / missing pixels come back as NaN — treat them as "no stress" (0) so
+    # the int cast is clean (the regional value is the spatial max over ocean).
     if "baa" in merged:
-        merged["baa"] = merged["baa"].round().clip(0, 4).astype("int8")
+        merged["baa"] = merged["baa"].fillna(0).round().clip(0, 4).astype("int8")
     merged.attrs.update(
         title="NOAA Coral Reef Watch 5km daily product suite (subset)",
         source=config.ERDDAP_BASE,
