@@ -46,27 +46,45 @@ c3.metric("Forecast horizon", f"{meta['horizon_days']} days")
 c4.metric("XGBoost macro-F1", f"{meta['metrics']['xgboost']['macro_f1']:.2f}")
 
 # --------------------------------------------------------------------------- #
-# Map of latest heat stress (uses the saved NetCDF cube)
+# Map of heat stress on a chosen date (uses the saved NetCDF cube)
 # --------------------------------------------------------------------------- #
 cube_path = config.DATA_DIR / f"{meta['region']}_{meta['source']}.nc"
-st.subheader("Latest heat stress across the region")
+st.subheader("Heat stress across the region")
 if cube_path.exists():
     ds = xr.open_dataset(cube_path)
-    var = st.selectbox("Layer", ["dhw", "ssta", "sst", "hotspot"], index=0,
-                       format_func=lambda v: {"dhw": "Degree Heating Weeks",
-                                              "ssta": "SST Anomaly",
-                                              "sst": "Sea Surface Temp",
-                                              "hotspot": "HotSpot"}[v])
-    snap = ds[var].isel(time=-1)
+    map_dates = pd.to_datetime(ds["time"].values)
+
+    c_layer, c_date = st.columns([1, 2])
+    var = c_layer.selectbox("Layer", ["dhw", "ssta", "sst", "hotspot"], index=0,
+                            format_func=lambda v: {"dhw": "Degree Heating Weeks",
+                                                   "ssta": "SST Anomaly",
+                                                   "sst": "Sea Surface Temp",
+                                                   "hotspot": "HotSpot"}[v])
+    # Default the slider to the most heat-stressed day, so the map shows
+    # something meaningful on load (the last calendar day is usually winter = 0).
+    peak_idx = int(ds["dhw"].max(dim=["latitude", "longitude"]).values.argmax())
+    picked = c_date.slider(
+        "Date", min_value=map_dates[0].to_pydatetime(),
+        max_value=map_dates[-1].to_pydatetime(),
+        value=map_dates[peak_idx].to_pydatetime(), format="YYYY-MM-DD",
+    )
+    ti = int(np.abs(map_dates - pd.Timestamp(picked)).argmin())
+    snap = ds[var].isel(time=ti)
+
+    # Heat-stress fields are non-negative; floor the colour scale at 0 so a calm
+    # day reads as calm rather than auto-scaling tiny noise into a full range.
+    zmin = 0 if var in ("dhw", "hotspot") else None
     fig_map = px.imshow(
         snap.values,
         x=ds.longitude.values, y=ds.latitude.values,
-        origin="lower", aspect="auto",
+        origin="lower", aspect="auto", zmin=zmin,
         color_continuous_scale="thermal" if var != "ssta" else "RdBu_r",
         labels={"color": var.upper()},
     )
     fig_map.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0),
                           xaxis_title="Longitude", yaxis_title="Latitude")
+    st.caption(f"Showing **{var.upper()}** on **{map_dates[ti].date()}** "
+               f"(region peak DHW falls on {map_dates[peak_idx].date()}).")
     st.plotly_chart(fig_map, width="stretch")
 else:
     st.info("NetCDF cube not found — map skipped (time series still available).")
