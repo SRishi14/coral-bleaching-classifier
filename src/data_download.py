@@ -108,62 +108,65 @@ def _open_griddap(dataset_id: str) -> xr.Dataset:
     )
 
 
-def _erddap_nc_fetch(dataset_id: str, var: str, lat_bounds, lon_bounds,
-                     time_bounds: tuple[str, str]) -> xr.Dataset:
+def _grid_metadata(dataset_id: str, var: str) -> dict:
     """
-    Fetch one variable subset from ERDDAP *griddap* as a NetCDF file over HTTP.
-
-    We deliberately use the ``.nc`` file endpoint rather than a lazy OPeNDAP read:
-    it returns the whole subset in one request and is markedly more reliable
-    against CoastWatch (some products' streaming DAP reads fail intermittently).
-
-    The griddap query selects by coordinate *value* as
-    ``[(start):stride:(stop)]`` per dimension, and the start value must sit at a
-    lower index than the stop value — so we order each range to match how the
-    dataset stores it (latitude often descends; longitude may be 0..360).
+    Open a griddap dataset *once* and capture the small facts needed to build
+    subset queries for it: coordinate names, the variable's dimension order, and
+    each axis's stored direction / longitude convention. Reused across all the
+    yearly chunks of that variable so we don't re-read coordinates every request.
     """
     meta = _open_griddap(dataset_id)
-    if var not in meta:
-        raise KeyError(
-            f"Variable '{var}' not in dataset '{dataset_id}'. "
-            f"Available: {list(meta.data_vars)}"
-        )
+    try:
+        if var not in meta:
+            raise KeyError(
+                f"Variable '{var}' not in dataset '{dataset_id}'. "
+                f"Available: {list(meta.data_vars)}"
+            )
+        latn = _coord_name(meta, ("latitude", "lat"))
+        lonn = _coord_name(meta, ("longitude", "lon"))
+        timn = _coord_name(meta, ("time",))
+        latv = np.asarray(meta[latn].values, dtype=float)
+        lonv = np.asarray(meta[lonn].values, dtype=float)
+        return {
+            "latn": latn, "lonn": lonn, "timn": timn,
+            "var_dims": tuple(meta[var].dims),
+            "lat_ascending": bool(latv[0] <= latv[-1]),
+            "lon_ascending": bool(lonv[0] <= lonv[-1]),
+            "lon_is_360": bool(float(np.nanmax(lonv)) > 180.0),
+        }
+    finally:
+        meta.close()
 
-    latn = _coord_name(meta, ("latitude", "lat"))
-    lonn = _coord_name(meta, ("longitude", "lon"))
-    timn = _coord_name(meta, ("time",))
-    latv = np.asarray(meta[latn].values, dtype=float)
-    lonv = np.asarray(meta[lonn].values, dtype=float)
-    var_dims = meta[var].dims
 
+def _build_griddap_url(dataset_id: str, var: str, grid: dict,
+                       lat_bounds, lon_bounds, time_bounds: tuple[str, str]) -> str:
+    """
+    Build an ERDDAP ``.nc`` griddap query URL for one space/time subset.
+
+    griddap selects by coordinate *value* as ``[(start):stride:(stop)]`` per
+    dimension, where ``start`` must sit at a lower index than ``stop`` — so each
+    range is ordered to match how the dataset stores that axis (latitude often
+    descends; longitude may be 0..360).
+    """
     lat0, lat1 = sorted(lat_bounds)
     lon0, lon1 = sorted(lon_bounds)
-    if float(np.nanmax(lonv)) > 180.0:           # dataset uses 0..360
+    if grid["lon_is_360"]:
         lon0, lon1 = sorted((lon0 % 360.0, lon1 % 360.0))
 
-    # Order each range to follow the coordinate's stored direction.
-    lat_q = (lat0, lat1) if latv[0] <= latv[-1] else (lat1, lat0)
-    lon_q = (lon0, lon1) if lonv[0] <= lonv[-1] else (lon1, lon0)
+    lat_q = (lat0, lat1) if grid["lat_ascending"] else (lat1, lat0)
+    lon_q = (lon0, lon1) if grid["lon_ascending"] else (lon1, lon0)
     t0, t1 = time_bounds
 
     ranges = {
-        timn: f"[({t0}):1:({t1})]",
-        latn: f"[({lat_q[0]}):1:({lat_q[1]})]",
-        lonn: f"[({lon_q[0]}):1:({lon_q[1]})]",
+        grid["timn"]: f"[({t0}):1:({t1})]",
+        grid["latn"]: f"[({lat_q[0]}):1:({lat_q[1]})]",
+        grid["lonn"]: f"[({lon_q[0]}):1:({lon_q[1]})]",
     }
-    # Build the constraint in the variable's own dimension order; pin any extra
-    # singleton dim (e.g. altitude) to its first index.
-    constraint = var + "".join(ranges.get(d, "[0:1:0]") for d in var_dims)
-    meta.close()
-
+    # Constraint in the variable's own dim order; pin any extra singleton
+    # dimension (e.g. altitude) to its first index.
+    constraint = var + "".join(ranges.get(d, "[0:1:0]") for d in grid["var_dims"])
     query = urllib.parse.quote(constraint, safe="[]():,.-")
-    url = f"{config.ERDDAP_BASE}/{dataset_id}.nc?{query}"
-
-    tmp = os.path.join(tempfile.gettempdir(), f"crw_{dataset_id}_{var}.nc")
-    _http_download(url, tmp)
-
-    ds = xr.open_dataset(tmp).load()
-    return subset_region(ds[[var]], lat_bounds, lon_bounds)  # clip + rename coords
+    return f"{config.ERDDAP_BASE}/{dataset_id}.nc?{query}"
 
 
 def _http_download(url: str, dest: str, attempts: int = 3) -> None:
@@ -199,12 +202,17 @@ def _fetch_variable(dataset_id: str, var: str, lat_bounds, lon_bounds,
 
     ERDDAP's proxy rejects a single multi-year subset request (HTTP 502), so we
     request one year at a time and concatenate along ``time`` — the standard way
-    to pull a long griddap series reliably.
+    to pull a long griddap series reliably. Dataset metadata is read once and
+    reused for every chunk.
     """
-    parts = [
-        _erddap_nc_fetch(dataset_id, var, lat_bounds, lon_bounds, win)
-        for win in _yearly_windows(*full_bounds)
-    ]
+    grid = _grid_metadata(dataset_id, var)
+    tmp = os.path.join(tempfile.gettempdir(), f"crw_{dataset_id}_{var}.nc")
+    parts = []
+    for win in _yearly_windows(*full_bounds):
+        url = _build_griddap_url(dataset_id, var, grid, lat_bounds, lon_bounds, win)
+        _http_download(url, tmp)
+        ds = xr.open_dataset(tmp).load()
+        parts.append(subset_region(ds[[var]], lat_bounds, lon_bounds))
     combined = xr.concat(parts, dim="time")
     # Drop any duplicate timestamps at chunk boundaries, keep chronological order.
     _, keep = np.unique(combined["time"].values, return_index=True)
@@ -221,7 +229,8 @@ def download_region_cube(region_key: str) -> xr.Dataset:
     """
     reg = config.REGIONS[region_key]
     lat_bounds, lon_bounds = reg["lat"], reg["lon"]
-    full_bounds = (config.START_DATE, config.END_DATE)
+    # The live download uses its own (shorter, recent) date window — see config.
+    full_bounds = (config.ERDDAP_START_DATE, config.ERDDAP_END_DATE)
 
     merged = xr.Dataset()
     for key, dataset_id in config.ERDDAP_DATASETS.items():

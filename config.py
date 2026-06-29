@@ -45,6 +45,14 @@ DEFAULT_REGION = "florida_keys"
 START_DATE = "2010-01-01"
 END_DATE = "2024-12-31"
 
+# The real ERDDAP download is network-bound (NOAA throttles griddap to a few
+# hundred KB/s), so the live path defaults to a shorter recent window than the
+# synthetic generator. This 2-year span includes the catastrophic 2023 Florida
+# Keys marine heatwave. Widen it for a longer real record (expect ~30 s of
+# download per variable-year).
+ERDDAP_START_DATE = "2023-01-01"
+ERDDAP_END_DATE = "2024-12-31"
+
 # --------------------------------------------------------------------------- #
 # NOAA Coral Reef Watch ERDDAP (CoastWatch).  These dataset IDs were correct at
 # build time; if a download fails, open the ERDDAP search page printed by

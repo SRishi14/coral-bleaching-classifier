@@ -61,11 +61,18 @@ python train.py                 # offline demo on synthetic data (default)
 streamlit run app.py            # open the dashboard
 ```
 
-Use the **real NOAA data** once you've confirmed your internet/OPeNDAP setup:
+Use the **real NOAA data** (live CoastWatch ERDDAP):
 
 ```bash
 python train.py --source erddap --region florida_keys
 ```
+
+The live path downloads the recent window set by `ERDDAP_START_DATE/END_DATE` in
+`config.py` (default 2023–2024, which captures the 2023 Florida Keys heatwave).
+NOAA throttles griddap, so expect ~30 s per variable-year; widen the window in
+`config.py` for a longer record. If a dataset ID has drifted or the network is
+down, the run stops with a clear error pointing at the ERDDAP search page — it
+never silently falls back to synthetic data.
 
 Other options:
 
